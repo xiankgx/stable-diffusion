@@ -1,21 +1,28 @@
-import argparse, os, sys, datetime, glob, importlib, csv
-import numpy as np
+import argparse
+import csv
+import datetime
+import glob
+import importlib
+import os
+import sys
 import time
+from functools import partial
+
+import wandb
+
+import numpy as np
+import pytorch_lightning as pl
 import torch
 import torchvision
-import pytorch_lightning as pl
-
-from packaging import version
 from omegaconf import OmegaConf
-from torch.utils.data import random_split, DataLoader, Dataset, Subset
-from functools import partial
+from packaging import version
 from PIL import Image
-
 from pytorch_lightning import seed_everything
+from pytorch_lightning.callbacks import Callback
 from pytorch_lightning.trainer import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
-from pytorch_lightning.utilities.distributed import rank_zero_only
 from pytorch_lightning.utilities import rank_zero_info
+from pytorch_lightning.utilities.distributed import rank_zero_only
+from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
@@ -173,10 +180,12 @@ class DataModuleFromConfig(pl.LightningDataModule):
             self.train_dataloader = self._train_dataloader
         if validation is not None:
             self.dataset_configs["validation"] = validation
-            self.val_dataloader = partial(self._val_dataloader, shuffle=shuffle_val_dataloader)
+            self.val_dataloader = partial(
+                self._val_dataloader, shuffle=shuffle_val_dataloader)
         if test is not None:
             self.dataset_configs["test"] = test
-            self.test_dataloader = partial(self._test_dataloader, shuffle=shuffle_test_loader)
+            self.test_dataloader = partial(
+                self._test_dataloader, shuffle=shuffle_test_loader)
         if predict is not None:
             self.dataset_configs["predict"] = predict
             self.predict_dataloader = self._predict_dataloader
@@ -195,7 +204,8 @@ class DataModuleFromConfig(pl.LightningDataModule):
                 self.datasets[k] = WrappedDataset(self.datasets[k])
 
     def _train_dataloader(self):
-        is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
+        is_iterable_dataset = isinstance(
+            self.datasets['train'], Txt2ImgIterableBaseDataset)
         if is_iterable_dataset or self.use_worker_init_fn:
             init_fn = worker_init_fn
         else:
@@ -216,7 +226,8 @@ class DataModuleFromConfig(pl.LightningDataModule):
                           shuffle=shuffle)
 
     def _test_dataloader(self, shuffle=False):
-        is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
+        is_iterable_dataset = isinstance(
+            self.datasets['train'], Txt2ImgIterableBaseDataset)
         if is_iterable_dataset or self.use_worker_init_fn:
             init_fn = worker_init_fn
         else:
@@ -263,7 +274,8 @@ class SetupCallback(Callback):
 
             if "callbacks" in self.lightning_config:
                 if 'metrics_over_trainsteps_checkpoint' in self.lightning_config['callbacks']:
-                    os.makedirs(os.path.join(self.ckptdir, 'trainstep_checkpoints'), exist_ok=True)
+                    os.makedirs(os.path.join(
+                        self.ckptdir, 'trainstep_checkpoints'), exist_ok=True)
             print("Project config")
             print(OmegaConf.to_yaml(self.config))
             OmegaConf.save(self.config,
@@ -287,6 +299,7 @@ class SetupCallback(Callback):
 
 
 class ImageLogger(Callback):
+
     def __init__(self, batch_frequency, max_images, clamp=True, increase_log_steps=True,
                  rescale=True, disabled=False, log_on_batch_idx=False, log_first_step=False,
                  log_images_kwargs=None):
@@ -296,8 +309,10 @@ class ImageLogger(Callback):
         self.max_images = max_images
         self.logger_log_images = {
             pl.loggers.TestTubeLogger: self._testtube,
+            pl.loggers.WandbLogger: self._wandb
         }
-        self.log_steps = [2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
+        self.log_steps = [
+            2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
             self.log_steps = [self.batch_freq]
         self.clamp = clamp
@@ -316,6 +331,33 @@ class ImageLogger(Callback):
             pl_module.logger.experiment.add_image(
                 tag, grid,
                 global_step=pl_module.global_step)
+
+    @rank_zero_only
+    @torch.no_grad()
+    def _wandb(self, pl_module, images, batch_idx, split):
+        for k in images:
+            # grid = torchvision.utils.make_grid(images[k])
+
+            grid = images[k]
+            print(f"{k}: type: {type(grid)}")
+            if hasattr(grid, "shape"):
+                print(f"shape: {grid.shape}")
+
+            grid = (grid + 1.0) / 2.0  # -1,1 -> 0,1; c,h,w
+
+            if isinstance(grid, torch.Tensor):
+                if grid.ndim == 3:
+                    grid = grid.unsqueeze(0)
+
+                grid = (grid * 255).permute((0, 2, 3, 1)) \
+                    .detach() \
+                    .cpu().numpy() \
+                    .astype(np.uint8)
+
+            tag = f"images_{split}/{k}"
+            pl_module.logger.experiment.log({
+                tag: [wandb.Image(Image.fromarray(img.squeeze(-1) if img.shape[-1] == 1 else img)) for img in grid]
+            })
 
     @rank_zero_only
     def log_local(self, save_dir, split, images,
@@ -339,6 +381,7 @@ class ImageLogger(Callback):
 
     def log_img(self, pl_module, batch, batch_idx, split="train"):
         check_idx = batch_idx if self.log_on_batch_idx else pl_module.global_step
+
         if (self.check_frequency(check_idx) and  # batch_idx % self.batch_freq == 0
                 hasattr(pl_module, "log_images") and
                 callable(pl_module.log_images) and
@@ -350,7 +393,11 @@ class ImageLogger(Callback):
                 pl_module.eval()
 
             with torch.no_grad():
-                images = pl_module.log_images(batch, split=split, **self.log_images_kwargs)
+                images = pl_module.log_images(
+                    batch,
+                    split=split,
+                    **self.log_images_kwargs
+                )
 
             for k in images:
                 N = min(images[k].shape[0], self.max_images)
@@ -363,13 +410,17 @@ class ImageLogger(Callback):
             self.log_local(pl_module.logger.save_dir, split, images,
                            pl_module.global_step, pl_module.current_epoch, batch_idx)
 
-            logger_log_images = self.logger_log_images.get(logger, lambda *args, **kwargs: None)
+            logger_log_images = self.logger_log_images.get(
+                logger, lambda *args, **kwargs: None)
             logger_log_images(pl_module, images, pl_module.global_step, split)
 
             if is_train:
                 pl_module.train()
 
     def check_frequency(self, check_idx):
+        # XXX
+        # return True
+
         if ((check_idx % self.batch_freq) == 0 or (check_idx in self.log_steps)) and (
                 check_idx > 0 or self.log_first_step):
             try:
@@ -393,6 +444,7 @@ class ImageLogger(Callback):
 
 
 class CUDACallback(Callback):
+
     # see https://github.com/SeanNaren/minGPT/blob/master/mingpt/callback.py
     def on_train_epoch_start(self, trainer, pl_module):
         # Reset the memory use counter
@@ -402,7 +454,8 @@ class CUDACallback(Callback):
 
     def on_train_epoch_end(self, trainer, pl_module, outputs):
         torch.cuda.synchronize(trainer.root_gpu)
-        max_memory = torch.cuda.max_memory_allocated(trainer.root_gpu) / 2 ** 20
+        max_memory = torch.cuda.max_memory_allocated(
+            trainer.root_gpu) / 2 ** 20
         epoch_time = time.time() - self.start_time
 
         try:
@@ -489,7 +542,8 @@ if __name__ == "__main__":
             ckpt = os.path.join(logdir, "checkpoints", "last.ckpt")
 
         opt.resume_from_checkpoint = ckpt
-        base_configs = sorted(glob.glob(os.path.join(logdir, "configs/*.yaml")))
+        base_configs = sorted(
+            glob.glob(os.path.join(logdir, "configs/*.yaml")))
         opt.base = base_configs + opt.base
         _tmp = logdir.split("/")
         nowname = _tmp[-1]
@@ -583,11 +637,12 @@ if __name__ == "__main__":
         if "modelcheckpoint" in lightning_config:
             modelckpt_cfg = lightning_config.modelcheckpoint
         else:
-            modelckpt_cfg =  OmegaConf.create()
+            modelckpt_cfg = OmegaConf.create()
         modelckpt_cfg = OmegaConf.merge(default_modelckpt_cfg, modelckpt_cfg)
         print(f"Merged modelckpt-cfg: \n{modelckpt_cfg}")
         if version.parse(pl.__version__) < version.parse('1.4.0'):
-            trainer_kwargs["checkpoint_callback"] = instantiate_from_config(modelckpt_cfg)
+            trainer_kwargs["checkpoint_callback"] = instantiate_from_config(
+                modelckpt_cfg)
 
         # add callback which sets up log directory
         default_callbacks_cfg = {
@@ -612,7 +667,7 @@ if __name__ == "__main__":
                 }
             },
             "learning_rate_logger": {
-                "target": "main.LearningRateMonitor",
+                "target": "pytorch_lightning.callbacks.LearningRateMonitor",
                 "params": {
                     "logging_interval": "step",
                     # "log_momentum": True
@@ -623,7 +678,8 @@ if __name__ == "__main__":
             },
         }
         if version.parse(pl.__version__) >= version.parse('1.4.0'):
-            default_callbacks_cfg.update({'checkpoint_callback': modelckpt_cfg})
+            default_callbacks_cfg.update(
+                {'checkpoint_callback': modelckpt_cfg})
 
         if "callbacks" in lightning_config:
             callbacks_cfg = lightning_config.callbacks
@@ -634,19 +690,20 @@ if __name__ == "__main__":
             print(
                 'Caution: Saving checkpoints every n train steps without deleting. This might require some free space.')
             default_metrics_over_trainsteps_ckpt_dict = {
-                'metrics_over_trainsteps_checkpoint':
-                    {"target": 'pytorch_lightning.callbacks.ModelCheckpoint',
-                     'params': {
-                         "dirpath": os.path.join(ckptdir, 'trainstep_checkpoints'),
-                         "filename": "{epoch:06}-{step:09}",
-                         "verbose": True,
-                         'save_top_k': -1,
-                         'every_n_train_steps': 10000,
-                         'save_weights_only': True
-                     }
-                     }
+                'metrics_over_trainsteps_checkpoint': {
+                    "target": 'pytorch_lightning.callbacks.ModelCheckpoint',
+                    'params': {
+                        "dirpath": os.path.join(ckptdir, 'trainstep_checkpoints'),
+                        "filename": "{epoch:06}-{step:09}",
+                        "verbose": True,
+                        'save_top_k': -1,
+                        'every_n_train_steps': 10000,
+                        'save_weights_only': True
+                    }
+                }
             }
-            default_callbacks_cfg.update(default_metrics_over_trainsteps_ckpt_dict)
+            default_callbacks_cfg.update(
+                default_metrics_over_trainsteps_ckpt_dict)
 
         callbacks_cfg = OmegaConf.merge(default_callbacks_cfg, callbacks_cfg)
         if 'ignore_keys_callback' in callbacks_cfg and hasattr(trainer_opt, 'resume_from_checkpoint'):
@@ -654,10 +711,12 @@ if __name__ == "__main__":
         elif 'ignore_keys_callback' in callbacks_cfg:
             del callbacks_cfg['ignore_keys_callback']
 
-        trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
+        trainer_kwargs["callbacks"] = [
+            instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg
+        ]
 
         trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
-        trainer.logdir = logdir  ###
+        trainer.logdir = logdir
 
         # data
         data = instantiate_from_config(config.data)
@@ -668,12 +727,17 @@ if __name__ == "__main__":
         data.setup()
         print("#### Data #####")
         for k in data.datasets:
-            print(f"{k}, {data.datasets[k].__class__.__name__}, {len(data.datasets[k])}")
+            print(
+                f"{k}, {data.datasets[k].__class__.__name__}, {len(data.datasets[k])}"
+            )
 
         # configure learning rate
         bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
         if not cpu:
-            ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
+            if "," in lightning_config.trainer.gpus:
+                ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
+            else:
+                ngpu = int(lightning_config.trainer.gpus)
         else:
             ngpu = 1
         if 'accumulate_grad_batches' in lightning_config.trainer:
@@ -692,8 +756,8 @@ if __name__ == "__main__":
             print("++++ NOT USING LR SCALING ++++")
             print(f"Setting learning rate to {model.learning_rate:.2e}")
 
-
         # allow checkpointing via USR1
+
         def melk(*args, **kwargs):
             # run all checkpoint hooks
             if trainer.global_rank == 0:
@@ -701,12 +765,10 @@ if __name__ == "__main__":
                 ckpt_path = os.path.join(ckptdir, "last.ckpt")
                 trainer.save_checkpoint(ckpt_path)
 
-
         def divein(*args, **kwargs):
             if trainer.global_rank == 0:
-                import pudb;
+                import pudb
                 pudb.set_trace()
-
 
         import signal
 

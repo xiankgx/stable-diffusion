@@ -189,6 +189,17 @@ Values that approach 1.0 allow for lots of variations but will also produce imag
 
 This procedure can, for example, also be used to upscale samples from the base model.
 
+## Training
+
+Steps:
+
+1. To avoid having to train the first stage autoencoder model, extract its weights from a pretrained checkpoint with the help of this [notebook](notebooks/extract_model_state_dict.ipynb). 
+2. Make a copy of this [config file](configs/stable-diffusion/v1-finetune.yaml) and modify as necessary.
+3. Execute the following command.
+
+```bash
+python main.py --base configs/stable-diffusion/v1-finetune.yaml -t --gpus 0,1,2,3
+```
 
 ## Comments 
 

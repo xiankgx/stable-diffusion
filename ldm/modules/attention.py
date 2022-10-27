@@ -205,10 +205,11 @@ class BasicTransformerBlock(nn.Module):
         self.norm3 = nn.LayerNorm(dim)
         self.checkpoint = checkpoint
 
-    def forward(self, x, context=None):
-        return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
+    # def forward(self, x, context=None):
+    #     return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
 
-    def _forward(self, x, context=None):
+    # def _forward(self, x, context=None):
+    def forward(self, x, context=None):
         x = self.attn1(self.norm1(x)) + x
         x = self.attn2(self.norm2(x), context=context) + x
         x = self.ff(self.norm3(x)) + x
