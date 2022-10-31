@@ -1,4 +1,8 @@
+import glob
+import os
+
 import numpy as np
+import pandas as pd
 import webdataset as wds
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from PIL import Image
@@ -8,33 +12,66 @@ from torchvision import transforms
 Image.MAX_IMAGE_PIXELS = None
 
 
-class ImageDataset(Dataset):
+class ImageCaptioningDataset(Dataset):
 
-    def __init__(self, image_list_file,
+    def __init__(self, annotations_csv_file=None,
+                 image_col="image",
+                 text_col="caption",
+                 image_root=None,
                  size=256,
                  hflip=False,
-                 scale=(0.25, 1.0)):
+                 random_crop=True,
+                 random_crop_scale=(0.8, 1.0),
+                 repeats=1):
         super().__init__()
 
-        # Open image list file assuming one path for each line
-        with open(image_list_file, "r") as f:
-            images = f.readlines()
+        if annotations_csv_file is not None:
+            # Assuming image paths and captions providied in annotations csv file
 
-        images = [l.strip() for l in images]
-        print(f"num files: {len(images)}")
-        print(f"top 5 files: {images[:5]}")
-        self.images = images
+            df = pd.read_csv(annotations_csv_file)
 
-        size = (size, size) if not isinstance(size, (list, tuple)) else size
-        self.transform = transforms.Compose(
-            ([transforms.RandomHorizontalFlip(p=0.5), ] if hflip else [])
-            + [
-                transforms.RandomResizedCrop(
-                    size=size,
-                    scale=scale,
-                    interpolation=3
+            if image_root is not None:
+                df[image_col] = df[image_col].map(
+                    lambda p: os.path.join(image_root, p)
                 )
-            ])
+
+            images = df[image_col].tolist()
+            captions = df[text_col].tolist()
+        else:
+            # No annotations csv file provided, assuming image filenames as captions
+
+            assert image_root is not None, "Must provide at least one of 'annotations_csv_file' and 'image_root'."
+            images = glob.glob(image_root + "/**/*.jpg", recursive=True) + \
+                glob.glob(image_root + "/**/*.png", recursive=True)
+            captions = list(map(lambda p: os.path.splitext(os.path.basename(p))[0],
+                                images))
+
+        # Repeat lists for some number of times
+        if repeats > 1:
+            images = images * repeats
+            captions = captions * repeats
+
+        print(f"num files: {len(images)}")
+        # print(f"top 5 files: {images[:5]}")
+        self.images = images
+        self.captions = captions
+
+        # Image transforms
+        size = (size, size) if not isinstance(size, (list, tuple)) else size
+        flip = [transforms.RandomHorizontalFlip(p=0.5), ] if hflip else []
+        crop = [
+            transforms.RandomResizedCrop(
+                size=size,
+                scale=random_crop_scale,
+                ratio=(1, 1),
+                interpolation=transforms.InterpolationMode.BICUBIC
+            )
+        ] if random_crop else [
+            transforms.Resize(size, interpolation=transforms.InterpolationMode.BICUBIC), 
+        ]
+        self.transform = transforms.Compose(
+            flip + crop
+        )
 
     def __len__(self):
         return len(self.images)
@@ -43,17 +80,19 @@ class ImageDataset(Dataset):
         img_path = self.images[idx]
         img = Image.open(img_path).convert("RGB")
 
+        caption = self.captions[idx]
+
         img = self.transform(img)
 
-        # XXX Following ldm.data.imagenet.ImageNetSR
+        # Output image in np.ndarray format
         img = np.asarray(img)
 
-        # Normalize
-        # [0, 255] -> [-1, 1]
+        # Normalize: [0, 255] -> [-1, 1]
         img = (img/np.float32(255) - 0.5) * 2
 
         return {
-            "image": img
+            "image": img,
+            "caption": caption
         }
 
 
@@ -106,9 +145,9 @@ class WebdatasetImageCaptionDataset(Txt2ImgIterableBaseDataset):
             transforms.RandomResizedCrop(
                 size=size,
                 scale=self.random_crop_scale,
-                interpolation=3
+                interpolation=transforms.InterpolationMode.BICUBIC
             )
-        ] if self.random_crop else [transforms.Resize(size, interpolation=3), ]
+        ] if self.random_crop else [transforms.Resize(size, interpolation=transforms.InterpolationMode.BICUBIC), ]
 
         transform = transforms.Compose(
             flip + crop

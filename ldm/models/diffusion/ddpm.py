@@ -6,10 +6,10 @@ https://github.com/CompVis/taming-transformers
 -- merci
 """
 
+import itertools
 from contextlib import contextmanager
 from functools import partial
 
-from torch.autograd import detect_anomaly
 import numpy as np
 import pytorch_lightning as pl
 import torch
@@ -26,10 +26,10 @@ from ldm.modules.ema import LitEma
 from ldm.util import (count_params, default, exists, instantiate_from_config,
                       isimage, ismap, log_txt_as_img, mean_flat)
 from pytorch_lightning.utilities.distributed import rank_zero_only
+from torch.autograd import detect_anomaly
 from torch.optim.lr_scheduler import LambdaLR
 from torchvision.utils import make_grid
 from tqdm import tqdm
-
 
 __conditioning_keys__ = {
     'concat': 'c_concat',
@@ -234,8 +234,31 @@ class DDPM(pl.LightningModule):
                 if context is not None:
                     print(f"{context}: Restored training weights")
 
+    # def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
+    #     sd = torch.load(path, map_location="cpu")
+    #     if "state_dict" in list(sd.keys()):
+    #         sd = sd["state_dict"]
+
+    #     keys = list(sd.keys())
+    #     for k in keys:
+    #         for ik in ignore_keys:
+    #             if k.startswith(ik):
+    #                 print("Deleting key {} from state_dict.".format(k))
+    #                 del sd[k]
+
+    #     missing, unexpected = self.load_state_dict(sd, strict=False) if not only_model \
+    #         else self.model.load_state_dict(sd, strict=False)
+    #     print(
+    #         f"Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
+    #     if len(missing) > 0:
+    #         print(f"Missing Keys: {missing}")
+    #     if len(unexpected) > 0:
+    #         print(f"Unexpected Keys: {unexpected}")
+
+    @torch.no_grad()
     def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
         sd = torch.load(path, map_location="cpu")
+
         if "state_dict" in list(sd.keys()):
             sd = sd["state_dict"]
 
@@ -246,8 +269,54 @@ class DDPM(pl.LightningModule):
                     print("Deleting key {} from state_dict.".format(k))
                     del sd[k]
 
-        missing, unexpected = self.load_state_dict(sd, strict=False) if not only_model \
-            else self.model.load_state_dict(sd, strict=False)
+        # To fit non-matching weights shape of the same key: https://github.com/justinpinkney/stable-diffusion
+        if True:
+            n_params = len([name for name, _ in
+                            itertools.chain(self.named_parameters(),
+                                            self.named_buffers())])
+            for name, param in tqdm(
+                    itertools.chain(self.named_parameters(),
+                                    self.named_buffers()),
+                    desc="Fitting old weights to new weights",
+                    total=n_params
+            ):
+                if not name in sd:
+                    continue
+                old_shape = sd[name].shape
+                new_shape = param.shape
+                assert len(old_shape) == len(new_shape)
+                if len(new_shape) > 2:
+                    # we only modify first two axes
+                    assert new_shape[2:] == old_shape[2:]
+                # assumes first axis corresponds to output dim
+                if not new_shape == old_shape:
+                    new_param = param.clone()
+                    old_param = sd[name]
+                    if len(new_shape) == 1:
+                        for i in range(new_param.shape[0]):
+                            new_param[i] = old_param[i % old_shape[0]]
+                    elif len(new_shape) >= 2:
+                        for i in range(new_param.shape[0]):
+                            for j in range(new_param.shape[1]):
+                                new_param[i, j] = old_param[i %
+                                                            old_shape[0], j % old_shape[1]]
+
+                        n_used_old = torch.ones(old_shape[1])
+                        for j in range(new_param.shape[1]):
+                            n_used_old[j % old_shape[1]] += 1
+                        n_used_new = torch.zeros(new_shape[1])
+                        for j in range(new_param.shape[1]):
+                            n_used_new[j] = n_used_old[j % old_shape[1]]
+
+                        n_used_new = n_used_new[None, :]
+                        while len(n_used_new.shape) < len(new_shape):
+                            n_used_new = n_used_new.unsqueeze(-1)
+                        new_param /= n_used_new
+
+                    sd[name] = new_param
+
+        missing, unexpected = self.load_state_dict(sd, strict=False) if not only_model else self.model.load_state_dict(
+            sd, strict=False)
         print(
             f"Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
         if len(missing) > 0:
@@ -414,8 +483,8 @@ class DDPM(pl.LightningModule):
         return loss, loss_dict
 
     def training_step(self, batch, batch_idx):
-        with detect_anomaly():
-            loss, loss_dict = self.shared_step(batch)
+        # with detect_anomaly():
+        loss, loss_dict = self.shared_step(batch)
 
         self.log_dict(loss_dict,
                       prog_bar=True,
@@ -545,18 +614,18 @@ class LatentDiffusion(DDPM):
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
         self.scale_by_std = scale_by_std
         assert self.num_timesteps_cond <= kwargs['timesteps']
-        
+
         # for backwards compatibility after implementation of DiffusionWrapper
         if conditioning_key is None:
             conditioning_key = 'concat' if concat_mode else 'crossattn'
         if cond_stage_config == '__is_unconditional__':
             conditioning_key = None
-        
+
         ckpt_path = kwargs.pop("ckpt_path", None)
         ignore_keys = kwargs.pop("ignore_keys", [])
-        
+
         super().__init__(conditioning_key=conditioning_key, *args, **kwargs)
-        
+
         self.concat_mode = concat_mode
         self.cond_stage_trainable = cond_stage_trainable
         self.cond_stage_key = cond_stage_key
@@ -1043,24 +1112,24 @@ class LatentDiffusion(DDPM):
         return loss
 
     def forward(self, x, c, *args, **kwargs):
-            t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device) \
-                .long()
+        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device) \
+            .long()
 
-            if self.model.conditioning_key is not None:
-                assert c is not None
+        if self.model.conditioning_key is not None:
+            assert c is not None
 
-                if self.cond_stage_trainable:
-                    c = self.get_learned_conditioning(c)
+            if self.cond_stage_trainable:
+                c = self.get_learned_conditioning(c)
 
-                if self.shorten_cond_schedule:  # TODO: drop this option
-                    tc = self.cond_ids[t].to(self.device)
-                    c = self.q_sample(
-                        x_start=c,
-                        t=tc,
-                        noise=torch.randn_like(c.float())
-                    )
+            if self.shorten_cond_schedule:  # TODO: drop this option
+                tc = self.cond_ids[t].to(self.device)
+                c = self.q_sample(
+                    x_start=c,
+                    t=tc,
+                    noise=torch.randn_like(c.float())
+                )
 
-            return self.p_losses(x, c, t, *args, **kwargs)
+        return self.p_losses(x, c, t, *args, **kwargs)
 
     def _rescale_annotations(self, bboxes, crop_coordinates):  # TODO: move to dataset
         def rescale_bbox(bbox):
